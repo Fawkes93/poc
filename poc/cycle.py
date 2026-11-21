@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from poc.ai.client import decide as decide_with_gemini
 from poc.candles import bars_from_trendbars, latest_close, load_recent
+from poc.history import sync_bars
 from poc.config import Settings
 from poc.levels import build_levels
 from poc.market import as_utc, session_name, weekend_closed
@@ -154,26 +155,15 @@ def _notify_error(store: Store, notify: Callable[[str], None] | None, message: s
 
 
 def _market_bars(factor: Any, settings: Settings, store: Store, now: datetime) -> tuple[list, str]:
-    """One 15-minute load for the map. cTrader is cached so the price poll does not pull history."""
+    """Bars kept in SQLite. cTrader is asked for the missing slices, then cached for the hour."""
     cached = _cached_bars()
     if cached is not None:
         return cached
-    loader = getattr(factor, "list_trendbars", None)
-    if loader is not None:
-        since = as_utc(now) - timedelta(days=settings.history_days)
-        failed = False
-        try:
-            rows = loader(since)
-            bars = bars_from_trendbars(rows if isinstance(rows, list) else [])
-        except Exception as exc:
-            failed = True
-            store.log("warn", "profile_bars", str(exc)[:300])
-            bars = []
+    if getattr(factor, "list_trendbars", None) is not None:
+        bars = sync_bars(factor, settings, store, now)
         if bars:
             _store_bars(bars, "ctrader")
             return bars, "ctrader"
-        if not failed:
-            store.log("warn", "profile_bars", "cTrader returned no 15-minute bars")
     try:
         bars = load_recent(settings, now)
     except Exception as exc:

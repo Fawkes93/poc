@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from poc.broker import build_broker
 from poc.config import ROOT, Settings
 from poc.cycle import flatten, run_cycle, status_text
+from poc.monitor import start_monitor
 from poc.notify import send_message, start_bot
 from poc.scheduler import next_check, poll_price_alerts
 from poc.store import Store
@@ -88,10 +89,12 @@ async def _serve(settings: Settings, store: Store) -> None:
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(analysis, "cron", id="check", hour="*", minute=settings.check_minute)
     scheduler.start()
+    monitor = start_monitor(settings, store)
     upcoming = next_check(datetime.now(timezone.utc))
     print(
         f"POC up mode={settings.factor_mode} trading={settings.trading_enabled} "
-        f"label={settings.label} next={upcoming.strftime('%Y-%m-%d %H:%M')}Z",
+        f"label={settings.label} next={upcoming.strftime('%Y-%m-%d %H:%M')}Z"
+        + (f" logs={monitor.url}" if monitor is not None else ""),
         flush=True,
     )
     alert_task = asyncio.create_task(alerts())
@@ -136,6 +139,8 @@ async def _serve(settings: Settings, store: Store) -> None:
     finally:
         alert_task.cancel()
         scheduler.shutdown(wait=False)
+        if monitor is not None:
+            monitor.shutdown()
 
 
 def main(argv: list[str] | None = None) -> None:

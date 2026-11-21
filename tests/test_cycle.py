@@ -243,7 +243,7 @@ def test_ctrader_bars_are_loaded_once_and_used_for_the_map(tmp_path):
         def quote(self):
             return {"bid": 100.2, "ask": 100.4}
 
-        def list_trendbars(self, _since):
+        def list_trendbars(self, since, until=None):
             calls["n"] += 1
             return [
                 {
@@ -268,7 +268,7 @@ def test_ctrader_bars_are_loaded_once_and_used_for_the_map(tmp_path):
     broker = Bars()
     for _ in range(2):
         run_cycle(
-            settings=Settings(),
+            settings=Settings(history_days=21),
             store=store,
             factor=broker,
             now=NOW,

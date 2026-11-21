@@ -165,7 +165,7 @@ class HttpBroker:
             raise RuntimeError("unexpected quote payload")
         return {"bid": float(body["bid"]), "ask": float(body["ask"])}
 
-    def list_trendbars(self, since: datetime) -> list[dict[str, Any]]:
+    def list_trendbars(self, since: datetime, until: datetime | None = None) -> list[dict[str, Any]]:
         if not self.settings.factor_api_token:
             raise RuntimeError("missing_factor_token")
         params: dict[str, str] = {
@@ -173,6 +173,8 @@ class HttpBroker:
             "timeframe_min": "15",
             "since": since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
+        if until is not None:
+            params["until"] = until.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         account = self.settings.account_id_int()
         if account is not None:
             params["account_id"] = str(account)

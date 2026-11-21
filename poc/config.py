@@ -61,7 +61,7 @@ class Settings:
     min_confidence: float = 60.0
     max_daily_loss_usd: float = 25.0
     sr_cluster_usd: float = 8.0
-    history_days: int = 21
+    history_days: int = 120
     ai_timeout_sec: float = 90.0
     alert_poll_sec: int = 60
     alert_debounce_sec: int = 600
@@ -127,7 +127,7 @@ class Settings:
             min_confidence=_float("MIN_CONFIDENCE", 60.0),
             max_daily_loss_usd=_float("MAX_DAILY_LOSS_USD", 25.0),
             sr_cluster_usd=_float("SR_CLUSTER_USD", 8.0),
-            history_days=_int("HISTORY_DAYS", 21),
+            history_days=_int("HISTORY_DAYS", 120),
             ai_timeout_sec=_float("AI_TIMEOUT_SEC", 90.0),
             alert_poll_sec=_int("ALERT_POLL_SEC", 60),
             alert_debounce_sec=_int("ALERT_DEBOUNCE_SEC", 600),

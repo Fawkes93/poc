@@ -6,7 +6,7 @@ Hourly XAUUSD book. A model reads last week's value area and the nearby support 
 
 Each check builds a short picture of gold and asks a model what to do with one book.
 
-1. Load the last 21 days of XAU/USD 15-minute candles from cTrader through Factor. That is one cTrader slice. It covers the two weeks the value area uses, and the same bars supply support, resistance, and the daily trend. The weekly trend stays thin on that window. The bars are kept for about 50 minutes, so the price poll does not download them again. If that request fails or returns nothing, the same map is built from Reaktor candles.
+1. Read up to 120 days of XAU/USD 15-minute bars from `poc.sqlite`. Each check asks cTrader only for the slices that file does not have, 21 days at a time, newest first. After a restart the saved bars remain, and the request is the gap since the last bar. A rate limit keeps what is already stored. The same bars supply the value area, support, resistance, and trend. If cTrader returns nothing and the file is empty, the map falls back to Reaktor candles.
 2. Take the live cTrader bid and ask. Factor keeps that stream open, so a check reads the latest quote instead of opening a new session. The price on the map is the mid. A buy is checked and sent on the ask. A sell is checked and sent on the bid. If the quote is down, use Twelve Data, then the close of the last candle.
 3. Build two volume profiles from those bars: the last completed week, and the week still forming. Weeks start on Monday at 00:00 in Europe/Bucharest. Point of control (POC) is the price where the most ticks printed. The value area is the band around it that holds about 70% of that weight. VAH is the top of the band. VAL is the bottom.
 4. Send that map, the bid, the ask, the open position, any working pending order, and the recent closed trades to the model. The model answers with one JSON decision: leave the book, place a market order, or place a pending order. It also returns a stop, a target, a confidence score, and up to four prices that should wake an earlier check.
@@ -94,7 +94,7 @@ Fill `.env` before the first run. Startup refuses to start without `GEMINI_API_K
 | `MIN_STOP_USD` | Closest allowed stop. Default `5` |
 | `MIN_RR` | Minimum reward divided by risk. Default `1.2` |
 | `MIN_CONFIDENCE` | Minimum model score, from 0 to 100. Default `60` |
-| `HISTORY_DAYS` | cTrader history loaded each check. Default `21`, one slice. A longer value is several slices, newest first |
+| `HISTORY_DAYS` | Days of 15-minute bars kept in `poc.sqlite`. Default `120`. cTrader is asked only for the missing slices |
 | `LOG_HTTP` | `true` serves the log page. `false` leaves it off |
 | `LOG_HTTP_HOST` | Bind address. Default `127.0.0.1` |
 | `LOG_HTTP_PORT` | Default `8787` |

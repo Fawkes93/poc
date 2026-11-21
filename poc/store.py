@@ -6,7 +6,9 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
+
+from poc.market import Bar, as_utc
 
 
 _SCHEMA = """
@@ -58,6 +60,15 @@ CREATE TABLE IF NOT EXISTS telegram_subscribers (
     created_at TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'active'
 );
+CREATE TABLE IF NOT EXISTS bars (
+    open_time TEXT PRIMARY KEY,
+    open REAL NOT NULL,
+    high REAL NOT NULL,
+    low REAL NOT NULL,
+    close REAL NOT NULL,
+    tick_count REAL,
+    volume REAL
+);
 CREATE INDEX IF NOT EXISTS trades_created ON trades (created_at);
 CREATE INDEX IF NOT EXISTS logs_created ON logs (created_at);
 """
@@ -65,6 +76,23 @@ CREATE INDEX IF NOT EXISTS logs_created ON logs (created_at);
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _stamp(value: datetime) -> str:
+    return as_utc(value).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _log_level(level: str | None) -> str | None:
+    text = (level or "").strip().lower()
+    if text in {"", "all"}:
+        return None
+    if text in {"warn", "warning", "warnings"}:
+        return "warn"
+    if text in {"info", "information"}:
+        return "info"
+    if text in {"error", "errors"}:
+        return "error"
+    return text
 
 
 def _clip(value: object, limit: int) -> str | None:
@@ -90,6 +118,69 @@ class Store:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         return conn
+
+    def save_bars(self, bars: Sequence[Bar]) -> None:
+        if not bars:
+            return
+        rows = [
+            (
+                _stamp(bar.open_time),
+                bar.open,
+                bar.high,
+                bar.low,
+                bar.close,
+                bar.tick_count,
+                bar.volume,
+            )
+            for bar in bars
+        ]
+        with self._connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO bars (open_time, open, high, low, close, tick_count, volume)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(open_time) DO UPDATE SET
+                    open = excluded.open,
+                    high = excluded.high,
+                    low = excluded.low,
+                    close = excluded.close,
+                    tick_count = excluded.tick_count,
+                    volume = excluded.volume
+                """,
+                rows,
+            )
+            conn.commit()
+
+    def load_bars(self, since: datetime) -> list[Bar]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT open_time, open, high, low, close, tick_count, volume
+                FROM bars
+                WHERE open_time >= ?
+                ORDER BY open_time
+                """,
+                (_stamp(since),),
+            ).fetchall()
+        found: list[Bar] = []
+        for row in rows:
+            found.append(
+                Bar(
+                    open_time=as_utc(datetime.fromisoformat(str(row["open_time"]).replace("Z", "+00:00"))),
+                    open=float(row["open"]),
+                    high=float(row["high"]),
+                    low=float(row["low"]),
+                    close=float(row["close"]),
+                    tick_count=None if row["tick_count"] is None else float(row["tick_count"]),
+                    volume=None if row["volume"] is None else float(row["volume"]),
+                )
+            )
+        return found
+
+    def prune_bars(self, before: datetime) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM bars WHERE open_time < ?", (_stamp(before),))
+            conn.commit()
 
     def log(self, level: str, event: str, detail: object = None) -> None:
         payload = detail if isinstance(detail, str) or detail is None else json.dumps(detail, default=str)
@@ -243,6 +334,60 @@ class Store:
                 (limit,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def recent_events(self, level: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+        """Newest log rows. Warnings are stored as warn. The errors table is included with error."""
+        wanted = _log_level(level)
+        capped = max(1, min(int(limit), 1000))
+        with self._connect() as conn:
+            if wanted is None:
+                logs = conn.execute(
+                    "SELECT created_at, level, event, detail FROM logs ORDER BY id DESC LIMIT ?",
+                    (capped,),
+                ).fetchall()
+                failures = conn.execute(
+                    "SELECT created_at, message, traceback FROM errors ORDER BY id DESC LIMIT ?",
+                    (capped,),
+                ).fetchall()
+            elif wanted == "error":
+                logs = conn.execute(
+                    "SELECT created_at, level, event, detail FROM logs WHERE level = 'error' ORDER BY id DESC LIMIT ?",
+                    (capped,),
+                ).fetchall()
+                failures = conn.execute(
+                    "SELECT created_at, message, traceback FROM errors ORDER BY id DESC LIMIT ?",
+                    (capped,),
+                ).fetchall()
+            else:
+                logs = conn.execute(
+                    "SELECT created_at, level, event, detail FROM logs WHERE level = ? ORDER BY id DESC LIMIT ?",
+                    (wanted, capped),
+                ).fetchall()
+                failures = []
+        rows = [
+            {
+                "created_at": str(row["created_at"]),
+                "level": str(row["level"]),
+                "event": str(row["event"]),
+                "detail": "" if row["detail"] is None else str(row["detail"]),
+            }
+            for row in logs
+        ]
+        for row in failures:
+            detail = str(row["message"] or "")
+            trace = row["traceback"]
+            if trace:
+                detail = f"{detail}\n{trace}"
+            rows.append(
+                {
+                    "created_at": str(row["created_at"]),
+                    "level": "error",
+                    "event": "error",
+                    "detail": detail,
+                }
+            )
+        rows.sort(key=lambda item: item["created_at"], reverse=True)
+        return rows[:capped]
 
     def tables(self) -> list[str]:
         with self._connect() as conn:

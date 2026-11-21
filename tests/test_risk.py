@@ -9,7 +9,7 @@ from poc.risk import check_entry, entry_block
 OPEN = datetime(2026, 11, 11, 12, tzinfo=timezone.utc)
 WEEKEND = datetime(2026, 11, 14, 12, tzinfo=timezone.utc)
 BREAK = datetime(2026, 11, 12, 21, 30, tzinfo=timezone.utc)
-SETTINGS = Settings()
+SETTINGS = Settings(trading_enabled=True)
 
 
 def _decision(**over) -> Decision:

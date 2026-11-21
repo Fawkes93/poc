@@ -20,7 +20,16 @@ def load_candles(
 ) -> list[Bar]:
     if not settings.reaktor_supabase_url or not settings.reaktor_supabase_key:
         raise CandleError("missing reaktor supabase")
+    own_client = http is None
     client = http or httpx.Client(timeout=60)
+    try:
+        return _read_candles(settings, since, client)
+    finally:
+        if own_client:
+            client.close()
+
+
+def _read_candles(settings: Settings, since: datetime, client: httpx.Client) -> list[Bar]:
     bars: list[Bar] = []
     offset = 0
     page = 1000

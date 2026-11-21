@@ -23,6 +23,9 @@ class Broker(Protocol):
     def list_positions(self) -> list[dict[str, Any]]:
         ...
 
+    def list_pending_orders(self) -> list[dict[str, Any]]:
+        ...
+
 
 class StubBroker:
     def __init__(self) -> None:
@@ -79,10 +82,10 @@ class HttpBroker:
         self.settings = settings
         self.http = http or httpx.Client(timeout=30)
 
-    def _headers(self, run_id: str) -> dict[str, str]:
+    def _headers(self, key: str) -> dict[str, str]:
         return {
             "Authorization": f"Bearer {self.settings.factor_api_token}",
-            "Idempotency-Key": run_id,
+            "Idempotency-Key": key,
             "Content-Type": "application/json",
         }
 
@@ -105,24 +108,34 @@ class HttpBroker:
             "message": message or f"http {response.status_code}",
         }
 
-    def _post(self, path: str, payload: dict[str, Any], run_id: str) -> dict[str, Any]:
+    def _post(self, path: str, payload: dict[str, Any], key: str) -> dict[str, Any]:
         if not self.settings.factor_api_token:
             return {"success": False, "message": "missing_factor_token"}
         response = self.http.post(
             f"{self.settings.factor_base_url}{path}",
             json=payload,
-            headers=self._headers(run_id),
+            headers=self._headers(key),
         )
         return self._body(response)
 
     def place(self, payload: dict[str, Any], run_id: str) -> dict[str, Any]:
-        return self._post("/api/ai/orders", payload, run_id)
+        return self._post("/api/ai/orders", payload, f"{run_id}:place")
 
     def manage(self, payload: dict[str, Any], run_id: str) -> dict[str, Any]:
-        return self._post("/api/ai/positions/manage", payload, run_id)
+        position_id = payload.get("position_id")
+        action = payload.get("action")
+        return self._post(
+            "/api/ai/positions/manage",
+            payload,
+            f"{run_id}:manage:{position_id}:{action}",
+        )
 
     def cancel(self, payload: dict[str, Any], run_id: str) -> dict[str, Any]:
-        return self._post("/api/ai/orders/cancel", payload, run_id)
+        return self._post(
+            "/api/ai/orders/cancel",
+            payload,
+            f"{run_id}:cancel:{payload.get('order_id')}",
+        )
 
     def list_positions(self) -> list[dict[str, Any]]:
         if not self.settings.factor_api_token:
@@ -144,6 +157,31 @@ class HttpBroker:
         if isinstance(body, dict) and isinstance(body.get("positions"), list):
             return body["positions"]
         raise RuntimeError("unexpected positions payload")
+
+    def list_pending_orders(self) -> list[dict[str, Any]]:
+        if not self.settings.factor_api_token:
+            raise RuntimeError("missing_factor_token")
+        params: dict[str, str] = {}
+        account = self.settings.account_id_int()
+        if account is not None:
+            params["account_id"] = str(account)
+        response = self.http.get(
+            f"{self.settings.factor_base_url}/api/ai/orders",
+            params=params,
+            headers={"Authorization": f"Bearer {self.settings.factor_api_token}"},
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(self._body(response).get("message") or f"http {response.status_code}")
+        body = response.json()
+        if isinstance(body, list):
+            return [row for row in body if isinstance(row, dict)]
+        if isinstance(body, dict):
+            if body.get("success") is False:
+                raise RuntimeError(str(body.get("message") or "pending orders failed"))
+            rows = body.get("orders")
+            if isinstance(rows, list):
+                return [row for row in rows if isinstance(row, dict)]
+        raise RuntimeError("unexpected pending orders payload")
 
     def quote(self) -> dict[str, float]:
         if not self.settings.factor_api_token:

@@ -1,5 +1,6 @@
 """A cycle writes SQLite, places one order, and will not stack a second while one is working."""
 
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -8,7 +9,7 @@ from poc.ai.client import decide
 from poc.ai.prompt import system_prompt
 from poc.broker import StubBroker
 from poc.config import Settings
-from poc.cycle import clear_market_bars, run_cycle
+from poc.cycle import clear_market_bars, flatten, run_cycle
 from poc.market import Bar
 from poc.models import Decision
 from poc.store import Store
@@ -101,7 +102,7 @@ def test_flat_book_can_trade_again_and_the_close_is_a_result(tmp_path):
         return decision
 
     first = run_cycle(
-        settings=Settings(),
+        settings=Settings(trading_enabled=True),
         store=store,
         factor=factor,
         now=NOW,
@@ -115,7 +116,7 @@ def test_flat_book_can_trade_again_and_the_close_is_a_result(tmp_path):
     assert seen[0]["recent_trades"] == []
     assert seen[0]["active_trade"] is False
     still_open = run_cycle(
-        settings=Settings(),
+        settings=Settings(trading_enabled=True),
         store=store,
         factor=factor,
         now=NOW + timedelta(hours=1),
@@ -127,7 +128,7 @@ def test_flat_book_can_trade_again_and_the_close_is_a_result(tmp_path):
     assert seen[1]["active_trade"] is True
     factor.positions.clear()
     second = run_cycle(
-        settings=Settings(),
+        settings=Settings(trading_enabled=True),
         store=store,
         factor=factor,
         now=NOW + timedelta(hours=2),
@@ -198,7 +199,7 @@ def test_ctrader_quote_buys_the_ask_and_sells_the_bid(tmp_path):
     buy_broker = Quoted()
     seen: list[dict] = []
     run_cycle(
-        settings=Settings(),
+        settings=Settings(trading_enabled=True),
         store=buy_book,
         factor=buy_broker,
         now=NOW,
@@ -219,7 +220,7 @@ def test_ctrader_quote_buys_the_ask_and_sells_the_bid(tmp_path):
 
     sell_broker = Quoted()
     run_cycle(
-        settings=Settings(),
+        settings=Settings(trading_enabled=True),
         store=_store(tmp_path),
         factor=sell_broker,
         now=NOW,
@@ -288,6 +289,42 @@ def test_ctrader_bars_are_loaded_once_and_used_for_the_map(tmp_path):
     clear_market_bars()
 
 
+def test_an_alert_refreshes_cached_bars(tmp_path):
+    clear_market_bars()
+    calls = {"n": 0}
+
+    class Bars(StubBroker):
+        def quote(self):
+            return {"bid": 100.2, "ask": 100.4}
+
+        def list_trendbars(self, since, until=None):
+            calls["n"] += 1
+            return [
+                {
+                    "open_time": "2026-10-21T12:00:00Z",
+                    "open": 100.0,
+                    "high": 101.0,
+                    "low": 100.0,
+                    "close": 100.5,
+                    "tick_count": 80,
+                }
+            ]
+
+    store = _store(tmp_path)
+    broker = Bars()
+    for trigger in ("manual", "alert"):
+        run_cycle(
+            settings=Settings(history_days=21),
+            store=store,
+            factor=broker,
+            now=NOW,
+            trigger=trigger,
+            decide=lambda context: _decision(),
+        )
+    assert calls["n"] == 2
+    clear_market_bars()
+
+
 def test_notes_name_the_ctrader_order(tmp_path):
     notes: list[str] = []
     store = _store(tmp_path)
@@ -301,7 +338,7 @@ def test_notes_name_the_ctrader_order(tmp_path):
         reasoning="sell the level",
     )
     run_cycle(
-        settings=Settings(),
+        settings=Settings(trading_enabled=True),
         store=store,
         factor=factor,
         now=NOW,
@@ -374,7 +411,7 @@ def test_pending_limit_is_stored(tmp_path):
         reasoning="wait for value",
     )
     result = run_cycle(
-        settings=Settings(),
+        settings=Settings(trading_enabled=True),
         store=store,
         factor=factor,
         now=NOW,
@@ -419,7 +456,7 @@ def test_missing_pending_order_is_cleared_and_a_new_one_can_be_placed(tmp_path):
         manage_existing=[{"position_id": "1038604245", "action": "cancel"}],
     )
     result = run_cycle(
-        settings=Settings(),
+        settings=Settings(trading_enabled=True),
         store=store,
         factor=factor,
         now=NOW,
@@ -464,6 +501,236 @@ def test_cancel_failure_keeps_the_pending_order(tmp_path):
     assert result.final == "none"
     assert store.pending()["order_id"] == "1038604245"
     assert factor.orders == []
+
+
+def _close_pnl(store: Store, when: datetime, pnl: float) -> None:
+    with store._connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO trades (created_at, kind, status, side, volume, entry_price, detail)
+            VALUES (?, 'close', 'closed', 'buy', 0.01, 2400, ?)
+            """,
+            (
+                when.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                json.dumps({"pnl_usd": pnl, "result": "loss" if pnl < 0 else "win"}),
+            ),
+        )
+
+
+def _entry(**over) -> Decision:
+    return _decision(
+        action="market",
+        side="buy",
+        stop_loss=2380,
+        take_profit=2430,
+        reasoning="buy the level",
+        **over,
+    )
+
+
+def test_todays_loss_blocks_the_next_entry(tmp_path):
+    store = _store(tmp_path)
+    _close_pnl(store, NOW, -25)
+    factor = StubBroker()
+    result = run_cycle(
+        settings=Settings(trading_enabled=True),
+        store=store,
+        factor=factor,
+        now=NOW,
+        decide=lambda context: _entry(),
+        candles=_bars(),
+        price=2400.0,
+    )
+    assert result.reason == "daily_loss"
+    assert factor.orders == []
+
+
+def test_a_win_does_not_offset_the_daily_loss(tmp_path):
+    store = _store(tmp_path)
+    _close_pnl(store, NOW, -30)
+    _close_pnl(store, NOW, 40)
+    factor = StubBroker()
+    result = run_cycle(
+        settings=Settings(trading_enabled=True),
+        store=store,
+        factor=factor,
+        now=NOW,
+        decide=lambda context: _entry(),
+        candles=_bars(),
+        price=2400.0,
+    )
+    assert result.reason == "daily_loss"
+    assert factor.orders == []
+
+
+def test_yesterdays_loss_does_not_count(tmp_path):
+    store = _store(tmp_path)
+    _close_pnl(store, NOW - timedelta(days=1), -40)
+    factor = StubBroker()
+    result = run_cycle(
+        settings=Settings(trading_enabled=True),
+        store=store,
+        factor=factor,
+        now=NOW,
+        decide=lambda context: _entry(),
+        candles=_bars(),
+        price=2400.0,
+    )
+    assert result.final == "market"
+    assert len(factor.orders) == 1
+
+
+def test_flat_stores_the_realized_loss(tmp_path):
+    store = _store(tmp_path)
+
+    class Quoted(StubBroker):
+        def quote(self):
+            return {"bid": 2390.0, "ask": 2390.0}
+
+    factor = Quoted()
+    factor.positions.append(
+        {
+            "position_id": "7",
+            "side": "buy",
+            "volume": 0.01,
+            "entry_price": 2400.0,
+            "stop_loss": 2380.0,
+            "take_profit": 2430.0,
+        }
+    )
+    text = flatten(Settings(), store, factor)
+    assert "close 7" in text
+    assert store.realized_loss_usd(datetime.now(timezone.utc).date()) == 10.0
+
+
+class _Listing(StubBroker):
+    def __init__(self, ids: list[str], fail: bool = False) -> None:
+        super().__init__()
+        self.ids = ids
+        self.fail = fail
+
+    def list_pending_orders(self):
+        if self.fail:
+            raise RuntimeError("factor down")
+        return [{"order_id": item} for item in self.ids]
+
+
+def _stored_pending() -> dict:
+    return {
+        "order_id": "1038604245",
+        "side": "sell",
+        "order_type": "limit",
+        "volume": 0.01,
+        "entry_price": 3988.46,
+        "stop_loss": 3995.0,
+        "take_profit": 3974.57,
+    }
+
+
+def test_a_live_pending_order_survives_a_failed_cancel(tmp_path):
+    store = _store(tmp_path)
+    store.set_pending(_stored_pending())
+
+    class Broken(_Listing):
+        def cancel(self, payload, run_id):
+            self.cancelled.append({"run_id": run_id, "payload": payload})
+            return {
+                "success": False,
+                "message": "could not check the account: timeout",
+                "order_id": payload.get("order_id"),
+            }
+
+    factor = Broken(["1038604245"])
+    result = run_cycle(
+        settings=Settings(),
+        store=store,
+        factor=factor,
+        now=NOW,
+        decide=lambda context: _decision(
+            manage_existing=[{"position_id": "1038604245", "action": "cancel"}],
+        ),
+        candles=_bars(),
+        price=2400.0,
+    )
+    assert result.final == "none"
+    assert store.pending()["order_id"] == "1038604245"
+    assert factor.orders == []
+
+
+def test_a_missing_working_order_is_cleared(tmp_path):
+    store = _store(tmp_path)
+    store.set_pending(_stored_pending())
+    notes: list[str] = []
+    factor = _Listing([])
+    result = run_cycle(
+        settings=Settings(),
+        store=store,
+        factor=factor,
+        now=NOW,
+        decide=lambda context: _decision(),
+        candles=_bars(),
+        price=2400.0,
+        notify=notes.append,
+    )
+    assert result.final == "none"
+    assert store.pending() is None
+    assert factor.orders == []
+    assert "POC order 1038604245 is no longer working\nNo position was seen" in notes
+    with store._connect() as conn:
+        row = conn.execute(
+            "SELECT kind, status, reason FROM trades ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert row["kind"] == "cancel"
+    assert row["status"] == "cleared"
+    assert row["reason"] == "not_working"
+
+
+def test_a_gone_pending_order_can_be_replaced(tmp_path):
+    store = _store(tmp_path)
+    store.set_pending(_stored_pending())
+    factor = _Listing([])
+    result = run_cycle(
+        settings=Settings(trading_enabled=True),
+        store=store,
+        factor=factor,
+        now=NOW,
+        decide=lambda context: _decision(
+            action="pending",
+            side="buy",
+            entry_price=2385,
+            stop_loss=2365,
+            take_profit=2420,
+            reasoning="the old order is gone",
+        ),
+        candles=_bars(),
+        price=2400.0,
+    )
+    assert result.final == "pending"
+    assert store.pending()["order_id"] != "1038604245"
+    assert len(factor.orders) == 1
+
+
+def test_a_failed_pending_list_keeps_the_order(tmp_path):
+    store = _store(tmp_path)
+    store.set_pending(_stored_pending())
+    factor = _Listing([], fail=True)
+    result = run_cycle(
+        settings=Settings(trading_enabled=True),
+        store=store,
+        factor=factor,
+        now=NOW,
+        decide=lambda context: _entry(),
+        candles=_bars(),
+        price=2400.0,
+    )
+    assert result.reason == "pending_open"
+    assert store.pending()["order_id"] == "1038604245"
+    assert factor.orders == []
+    with store._connect() as conn:
+        row = conn.execute(
+            "SELECT event FROM logs WHERE event = 'pending_orders'"
+        ).fetchone()
+    assert row is not None
 
 
 def test_weekend_does_not_call_the_model(tmp_path):

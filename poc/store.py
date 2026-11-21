@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from contextlib import contextmanager
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
 from poc.market import Bar, as_utc
 
@@ -82,6 +83,35 @@ def _stamp(value: datetime) -> str:
     return as_utc(value).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def log_cutoff(now: datetime | None = None) -> datetime:
+    """Monday 00:00 UTC of the previous week. Older log rows are not kept."""
+    moment = as_utc(now or datetime.now(timezone.utc))
+    today = moment.replace(hour=0, minute=0, second=0, microsecond=0)
+    this_monday = today - timedelta(days=today.weekday())
+    return this_monday - timedelta(days=7)
+
+
+def _created_between(since: datetime | None, until: datetime | None) -> tuple[str, list]:
+    clauses: list[str] = []
+    params: list[str] = []
+    if since is not None:
+        clauses.append("created_at >= ?")
+        params.append(_stamp(since))
+    if until is not None:
+        clauses.append("created_at < ?")
+        params.append(_stamp(until))
+    if not clauses:
+        return "", params
+    return " WHERE " + " AND ".join(clauses), params
+
+
+def _and_level(time_sql: str, time_params: list, level: str) -> tuple[str, list]:
+    params = [*time_params, level]
+    if time_sql:
+        return time_sql + " AND level = ?", params
+    return " WHERE level = ?", params
+
+
 def _log_level(level: str | None) -> str | None:
     text = (level or "").strip().lower()
     if text in {"", "all"}:
@@ -109,15 +139,23 @@ class Store:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(_SCHEMA)
-            conn.commit()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """One connection per call. WAL is set once when the store is created."""
         conn = sqlite3.connect(self.path, timeout=10)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
-        return conn
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def save_bars(self, bars: Sequence[Bar]) -> None:
         if not bars:
@@ -182,7 +220,15 @@ class Store:
             conn.execute("DELETE FROM bars WHERE open_time < ?", (_stamp(before),))
             conn.commit()
 
+    def prune_logs(self, before: datetime | None = None) -> None:
+        cutoff = _stamp(before or log_cutoff())
+        with self._connect() as conn:
+            conn.execute("DELETE FROM logs WHERE created_at < ?", (cutoff,))
+            conn.execute("DELETE FROM errors WHERE created_at < ?", (cutoff,))
+            conn.commit()
+
     def log(self, level: str, event: str, detail: object = None) -> None:
+        self.prune_logs()
         payload = detail if isinstance(detail, str) or detail is None else json.dumps(detail, default=str)
         with self._connect() as conn:
             conn.execute(
@@ -192,6 +238,7 @@ class Store:
             conn.commit()
 
     def error(self, message: str, traceback: str | None = None, run_id: str | None = None) -> None:
+        self.prune_logs()
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO errors (created_at, run_id, message, traceback) VALUES (?, ?, ?, ?)",
@@ -335,33 +382,69 @@ class Store:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def recent_events(self, level: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+    def realized_loss_usd(self, day: date) -> float:
+        """Positive sum of losing closes on that UTC day. Wins do not reduce it."""
+        start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+        end = start + timedelta(days=1)
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT detail FROM trades
+                WHERE kind = 'close' AND created_at >= ? AND created_at < ?
+                """,
+                (_stamp(start), _stamp(end)),
+            ).fetchall()
+        loss = 0.0
+        for row in rows:
+            try:
+                detail = json.loads(row["detail"] or "{}")
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(detail, dict):
+                continue
+            pnl = detail.get("pnl_usd")
+            if isinstance(pnl, bool) or not isinstance(pnl, (int, float)):
+                continue
+            if pnl < 0:
+                loss += -float(pnl)
+        return round(loss, 2)
+
+    def recent_events(
+        self,
+        level: str | None = None,
+        limit: int = 200,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> list[dict[str, Any]]:
         """Newest log rows. Warnings are stored as warn. The errors table is included with error."""
         wanted = _log_level(level)
         capped = max(1, min(int(limit), 1000))
+        time_sql, time_params = _created_between(since, until)
         with self._connect() as conn:
             if wanted is None:
                 logs = conn.execute(
-                    "SELECT created_at, level, event, detail FROM logs ORDER BY id DESC LIMIT ?",
-                    (capped,),
+                    f"SELECT created_at, level, event, detail FROM logs{time_sql} ORDER BY id DESC LIMIT ?",
+                    (*time_params, capped),
                 ).fetchall()
                 failures = conn.execute(
-                    "SELECT created_at, message, traceback FROM errors ORDER BY id DESC LIMIT ?",
-                    (capped,),
+                    f"SELECT created_at, message, traceback FROM errors{time_sql} ORDER BY id DESC LIMIT ?",
+                    (*time_params, capped),
                 ).fetchall()
             elif wanted == "error":
+                where, params = _and_level(time_sql, time_params, "error")
                 logs = conn.execute(
-                    "SELECT created_at, level, event, detail FROM logs WHERE level = 'error' ORDER BY id DESC LIMIT ?",
-                    (capped,),
+                    f"SELECT created_at, level, event, detail FROM logs{where} ORDER BY id DESC LIMIT ?",
+                    (*params, capped),
                 ).fetchall()
                 failures = conn.execute(
-                    "SELECT created_at, message, traceback FROM errors ORDER BY id DESC LIMIT ?",
-                    (capped,),
+                    f"SELECT created_at, message, traceback FROM errors{time_sql} ORDER BY id DESC LIMIT ?",
+                    (*time_params, capped),
                 ).fetchall()
             else:
+                where, params = _and_level(time_sql, time_params, wanted)
                 logs = conn.execute(
-                    "SELECT created_at, level, event, detail FROM logs WHERE level = ? ORDER BY id DESC LIMIT ?",
-                    (wanted, capped),
+                    f"SELECT created_at, level, event, detail FROM logs{where} ORDER BY id DESC LIMIT ?",
+                    (*params, capped),
                 ).fetchall()
                 failures = []
         rows = [

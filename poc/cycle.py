@@ -24,7 +24,7 @@ from poc.risk import check_entry, check_manage, entry_block, pnl_result, pnl_usd
 from poc.store import Store
 
 _LOCK = threading.Lock()
-_BAR_CACHE_SEC = 50 * 60
+_BAR_CACHE_SEC = 14 * 60
 _bar_lock = threading.Lock()
 _bar_cache: dict[str, Any] = {"at": 0.0, "bars": None, "source": ""}
 
@@ -154,11 +154,14 @@ def _notify_error(store: Store, notify: Callable[[str], None] | None, message: s
     store.set("last_error_at", _iso(now))
 
 
-def _market_bars(factor: Any, settings: Settings, store: Store, now: datetime) -> tuple[list, str]:
-    """Bars kept in SQLite. cTrader is asked for the missing slices, then cached for the hour."""
-    cached = _cached_bars()
-    if cached is not None:
-        return cached
+def _market_bars(
+    factor: Any, settings: Settings, store: Store, now: datetime, trigger: str
+) -> tuple[list, str]:
+    """Bars kept in SQLite. An alert always refreshes the tail. Other checks reuse a short cache."""
+    if trigger != "alert":
+        cached = _cached_bars()
+        if cached is not None:
+            return cached
     if getattr(factor, "list_trendbars", None) is not None:
         bars = sync_bars(factor, settings, store, now)
         if bars:
@@ -356,6 +359,62 @@ def _record_close(
         )
 
 
+def _pending_ids(rows: list) -> set[str]:
+    found: set[str] = set()
+    for row in rows:
+        if isinstance(row, dict):
+            order_id = row.get("order_id")
+        else:
+            order_id = row
+        if order_id is None or str(order_id) == "":
+            continue
+        found.add(str(order_id))
+    return found
+
+
+def _reconcile_pending(
+    store: Store,
+    factor: Any,
+    notify: Callable[[str], None] | None,
+) -> None:
+    """Drop a stored pending order that cTrader is no longer working.
+
+    A missing list, or a failed list, keeps the row. Clearing it would allow a second order.
+    """
+    pending = store.pending()
+    if not pending or not pending.get("order_id"):
+        return
+    lister = getattr(factor, "list_pending_orders", None)
+    if lister is None:
+        return
+    try:
+        live = lister()
+    except Exception as exc:
+        store.log("warn", "pending_orders", str(exc)[:300])
+        return
+    if not isinstance(live, list):
+        store.log("warn", "pending_orders", "pending orders payload was not a list")
+        return
+    order_id = str(pending["order_id"])
+    if order_id in _pending_ids(live):
+        return
+    store.set_pending(None)
+    store.trade(
+        kind="cancel",
+        status="cleared",
+        reason="not_working",
+        side=pending.get("side"),
+        order_type=pending.get("order_type"),
+        volume=pending.get("volume"),
+        entry_price=pending.get("entry_price"),
+        stop_loss=pending.get("stop_loss"),
+        take_profit=pending.get("take_profit"),
+        order_id=order_id,
+    )
+    if notify is not None:
+        notify(f"POC order {order_id} is no longer working\nNo position was seen")
+
+
 def _reconcile(
     store: Store,
     positions: list[dict[str, Any]],
@@ -363,6 +422,7 @@ def _reconcile(
     now: datetime,
     notify: Callable[[str], None] | None,
     oz_per_lot: float,
+    factor: Any,
 ) -> list[str]:
     current = {str(row.get("position_id")) for row in positions if row.get("position_id")}
     previous = set(store.open_ids())
@@ -418,6 +478,7 @@ def _reconcile(
                 )
             )
     store.set_open_ids(sorted(current))
+    _reconcile_pending(store, factor, notify)
     return closed
 
 
@@ -465,6 +526,19 @@ def status_text(settings: Settings, store: Store, factor: Any) -> str:
     return "\n".join(lines)
 
 
+def _flat_exit(factor: Any) -> float | None:
+    try:
+        spot = spot_quote(factor)
+    except Exception:
+        return None
+    if not spot:
+        return None
+    try:
+        return (float(spot["bid"]) + float(spot["ask"])) / 2
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def flatten(settings: Settings, store: Store, factor: Any) -> str:
     """Close POC positions and cancel the working pending order."""
     lines: list[str] = []
@@ -474,8 +548,10 @@ def flatten(settings: Settings, store: Store, factor: Any) -> str:
         store.error(error, run_id=run_id)
         lines.append(f"positions {error}")
     else:
+        exit_price = _flat_exit(factor)
         closed_ids: list[str] = []
         for row in positions or []:
+            position_id = str(row.get("position_id"))
             payload = {
                 "account_id": settings.account_id_int(),
                 "position_id": row.get("position_id"),
@@ -484,16 +560,27 @@ def flatten(settings: Settings, store: Store, factor: Any) -> str:
             }
             sent = factor.manage(payload, run_id)
             lines.append(f"close {row.get('position_id')} {sent.get('message')}")
-            store.trade(
-                run_id=run_id,
-                kind="close",
-                status="closed" if sent.get("success") else "rejected",
-                reason=sent.get("message"),
-                position_id=str(row.get("position_id")),
-                side=row.get("side"),
-            )
             if sent.get("success"):
-                closed_ids.append(str(row.get("position_id")))
+                _record_close(
+                    store,
+                    position_id=position_id,
+                    exit_price=exit_price,
+                    reason="flat",
+                    run_id=run_id,
+                    oz_per_lot=settings.oz_per_lot,
+                    notify=None,
+                    position=row,
+                )
+                closed_ids.append(position_id)
+            else:
+                store.trade(
+                    run_id=run_id,
+                    kind="close",
+                    status="rejected",
+                    reason=sent.get("message"),
+                    position_id=position_id,
+                    side=row.get("side"),
+                )
         store.set_open_ids([item for item in store.open_ids() if item not in closed_ids])
     pending = store.pending()
     if pending and pending.get("order_id"):
@@ -583,7 +670,7 @@ def _run(
     bid: float | None = None
     ask: float | None = None
     if candles is None:
-        candles, candle_source = _market_bars(factor, settings, store, now)
+        candles, candle_source = _market_bars(factor, settings, store, now, trigger)
     if price is None:
         spot = None
         try:
@@ -625,7 +712,7 @@ def _run(
         store.error(position_error, run_id=run_id)
         store.log("error", "positions", position_error)
     else:
-        _reconcile(store, positions or [], price, now, notify, settings.oz_per_lot)
+        _reconcile(store, positions or [], price, now, notify, settings.oz_per_lot, factor)
         positions, position_error = _load_positions(factor)
     pending = store.pending()
     halted = store.get("halted", "0") == "1"
@@ -733,7 +820,7 @@ def _run(
         price=_side_price(decision.side, bid, ask, price),
         positions=positions or [],
         profile_ready=prior.poc is not None,
-        daily_loss=0.0,
+        daily_loss=store.realized_loss_usd(as_utc(now).date()),
     )
     if decision.action == "none":
         result.final = "none"

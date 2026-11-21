@@ -21,7 +21,7 @@ The model never talks to the broker. Python accepts or rejects the idea, then Fa
 
 1. If the model asks to cancel the working pending order, that cancel goes to Factor first. A replacement is allowed in the same check only after the cancel is confirmed.
 2. If a position is open, the model may leave it, close it, or move the stop to the entry price. A stop is not widened.
-3. A new idea is rejected when trading is off, the book is halted, confidence is below 60, the value area is missing, the position list could not be loaded, or another trade is already working.
+3. A new idea is rejected when trading is off, the book is halted, confidence is below 60, the value area is missing, the position list could not be loaded, another trade is already working, or today's realized losses have reached `MAX_DAILY_LOSS_USD`.
 4. A market order is allowed only while gold is open. A pending order is allowed during the weekday 21:00–22:00 UTC break, and is blocked from Friday 21:00 UTC through Sunday 22:00 UTC. Gold is also closed for that same hour on other weekdays.
 5. The stop and target must sit on the correct side of the entry. The stop must be at least $5 away. At the default 0.01 lot, one dollar of gold price is about one dollar of profit or loss, and the stop may not risk more than $25. Reward must be at least 1.2 times the risk.
 6. Python chooses the order type. A market order is for a level price is already at. A buy limit rests below the price and a buy stop rests above it. A sell limit rests above the price and a sell stop rests below it. Size is fixed at `VOLUME_LOTS`. The model's own size is ignored.
@@ -69,7 +69,7 @@ cp .env.example .env
 
 On Windows the virtualenv activates with `.venv\Scripts\activate`.
 
-Fill `.env` before the first run. Startup refuses to start without `GEMINI_API_KEY`, `REAKTOR_SUPABASE_URL`, and `REAKTOR_SUPABASE_KEY`.
+Fill `.env` before the first run. Startup refuses to start without `GEMINI_API_KEY`. Stub mode also requires the Reaktor URL and key, because that mode has no cTrader bars. HTTP mode reads cTrader bars and starts without Reaktor.
 
 | Variable | Purpose |
 | --- | --- |
@@ -79,18 +79,19 @@ Fill `.env` before the first run. Startup refuses to start without `GEMINI_API_K
 | `XAI_API_KEY` | Grok key. `GROK_API_KEY` is accepted under the same name |
 | `GROK_MODEL` | Default `grok-4.7` |
 | `TWELVEDATA_API_KEY` | Fallback live price. Optional when Factor can quote |
-| `REAKTOR_SUPABASE_URL` | Reaktor project URL. Required at startup; used when cTrader bars fail |
+| `REAKTOR_SUPABASE_URL` | Fallback 15-minute bars when cTrader returns nothing. Required at startup only when `FACTOR_MODE` is not `http` |
 | `REAKTOR_SUPABASE_KEY` | Key that can read `public.candles` |
 | `FACTOR_BASE_URL` | Factor origin, with no path |
 | `FACTOR_API_TOKEN` | Bearer token for the Factor AI routes |
 | `FACTOR_ACCOUNT_ID` | cTrader account id |
-| `FACTOR_MODE` | `http` to send orders, `stub` to keep them in memory |
-| `TRADING_ENABLED` | `true` sends orders. The sample file sets `false`. If the variable is omitted, the process default is on |
+| `FACTOR_MODE` | `http` sends orders to Factor. `stub` keeps them in memory. If the variable is omitted, the process uses `stub`. The sample file sets `http` |
+| `TRADING_ENABLED` | `true` sends orders. If the variable is omitted, trading stays off. The sample file sets `false` |
 | `AI_LABEL` | Broker label. Default `POC` |
 | `TELEGRAM_BOT_TOKEN` | Bot token. Optional |
 | `TELEGRAM_CHAT_ID` | Owner chat, if `/start` has not linked one yet |
 | `VOLUME_LOTS` | Fixed size. Default `0.01` |
 | `MAX_LOSS_USD` | Most one order may lose at that size. Default `25` |
+| `MAX_DAILY_LOSS_USD` | New entries stop once today's realized losses reach this amount. Default `25`. Wins do not reduce it |
 | `MIN_STOP_USD` | Closest allowed stop. Default `5` |
 | `MIN_RR` | Minimum reward divided by risk. Default `1.2` |
 | `MIN_CONFIDENCE` | Minimum model score, from 0 to 100. Default `60` |
@@ -109,7 +110,7 @@ pytest -q
 
 ## Logs
 
-`python -m poc` serves the log at http://127.0.0.1:8787/. The page lists the newest rows and refreshes every 5 seconds. Info, Warning, and Error each keep their own view. Warning is the `warn` level in SQLite. Error also includes rows from the errors table. The page binds to localhost. Set `LOG_HTTP=false` to leave it off.
+`python -m poc` serves the log at http://127.0.0.1:8787/. Times are shown as `21 Nov 18:05` UTC. The page refreshes every 5 seconds and can be limited to today, yesterday, or last week, and to Info, Warning, or Error. Last week is the previous Monday through Sunday. Rows older than that week are deleted. Warning is the `warn` level in SQLite. Error also includes rows from the errors table. The page binds to localhost. Set `LOG_HTTP=false` to leave it off.
 
 ## Messages
 
@@ -119,4 +120,4 @@ Notes, orders, and errors are stored in `poc.sqlite` beside the process. Errors,
 
 ## Risk
 
-The process can place, cancel, and close broker orders on the configured cTrader account. The checks above reject some ideas. They do not limit losses beyond that per-order cap. Use a demo account until the path is trusted. Run one process only. A second copy can send a second order.
+The process can place, cancel, and close broker orders on the configured cTrader account. The checks above reject some ideas. A new entry is refused once today's realized losses reach `MAX_DAILY_LOSS_USD`. A pending order that fills and is already closed before a check sees the position is not included in that sum. Use a demo account until the path is trusted. Run one process only. A second copy can send a second order.

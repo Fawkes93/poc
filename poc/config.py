@@ -1,4 +1,4 @@
-"""Environment configuration. Trading and Factor HTTP default on."""
+"""Environment configuration. Trading defaults off. Factor HTTP is opt-in."""
 
 from __future__ import annotations
 
@@ -47,8 +47,8 @@ class Settings:
     factor_base_url: str = ""
     factor_api_token: str = ""
     factor_account_id: str = ""
-    factor_mode: str = "http"
-    trading_enabled: bool = True
+    factor_mode: str = "stub"
+    trading_enabled: bool = False
     label: str = "POC"
     candle_symbol: str = "XAU/USD"
     broker_symbol: str = "XAUUSD"
@@ -77,10 +77,11 @@ class Settings:
         missing = []
         if not self.gemini_api_key:
             missing.append("GEMINI_API_KEY")
-        if not self.reaktor_supabase_url:
-            missing.append("REAKTOR_SUPABASE_URL")
-        if not self.reaktor_supabase_key:
-            missing.append("REAKTOR_SUPABASE_KEY")
+        if self.factor_mode != "http":
+            if not self.reaktor_supabase_url:
+                missing.append("REAKTOR_SUPABASE_URL")
+            if not self.reaktor_supabase_key:
+                missing.append("REAKTOR_SUPABASE_KEY")
         if missing:
             raise SystemExit("missing required env: " + ", ".join(missing))
 
@@ -117,8 +118,8 @@ class Settings:
             factor_base_url=os.getenv("FACTOR_BASE_URL", "").strip().rstrip("/"),
             factor_api_token=os.getenv("FACTOR_API_TOKEN", "").strip(),
             factor_account_id=os.getenv("FACTOR_ACCOUNT_ID", "").strip(),
-            factor_mode=(os.getenv("FACTOR_MODE", "http").strip().lower() or "http"),
-            trading_enabled=_bool("TRADING_ENABLED", True),
+            factor_mode=(os.getenv("FACTOR_MODE", "stub").strip().lower() or "stub"),
+            trading_enabled=_bool("TRADING_ENABLED", False),
             label=os.getenv("AI_LABEL", "POC").strip() or "POC",
             volume_lots=_float("VOLUME_LOTS", 0.01),
             max_loss_usd=_float("MAX_LOSS_USD", 25.0),

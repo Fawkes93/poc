@@ -145,6 +145,26 @@ class HttpBroker:
             return body["positions"]
         raise RuntimeError("unexpected positions payload")
 
+    def quote(self) -> dict[str, float]:
+        if not self.settings.factor_api_token:
+            raise RuntimeError("missing_factor_token")
+        params: dict[str, str] = {"symbol": self.settings.broker_symbol}
+        account = self.settings.account_id_int()
+        if account is not None:
+            params["account_id"] = str(account)
+        response = self.http.get(
+            f"{self.settings.factor_base_url}/api/ai/quote",
+            params=params,
+            headers={"Authorization": f"Bearer {self.settings.factor_api_token}"},
+            timeout=25,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(self._body(response).get("message") or f"http {response.status_code}")
+        body = response.json()
+        if not isinstance(body, dict):
+            raise RuntimeError("unexpected quote payload")
+        return {"bid": float(body["bid"]), "ask": float(body["ask"])}
+
     def list_trendbars(self, since: datetime) -> list[dict[str, Any]]:
         if not self.settings.factor_api_token:
             raise RuntimeError("missing_factor_token")

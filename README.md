@@ -6,11 +6,10 @@ Hourly XAUUSD book. A model reads last week's value area and the nearby support 
 
 Each check builds a short picture of gold and asks a model what to do with one book.
 
-1. Load XAU/USD 15-minute candles from Reaktor. These candles supply support, resistance, and the weekly and daily trend.
-2. Take the live price from Twelve Data. If that call fails, use the close of the last candle.
-3. Build two volume profiles: the last completed week, and the week still forming. Weeks start on Monday at 00:00 in Europe/Bucharest. The preferred bars are cTrader 15-minute ticks from Factor. If that request fails or returns nothing, the same profiles are built from the Reaktor candles.
-4. Point of control (POC) is the price where the most ticks printed. The value area is the band around it that holds about 70% of that weight. VAH is the top of the band. VAL is the bottom.
-5. Send that map, the live price, the open position, any working pending order, and the recent closed trades to the model. The model answers with one JSON decision: leave the book, place a market order, or place a pending order. It also returns a stop, a target, a confidence score, and up to four prices that should wake an earlier check.
+1. Load XAU/USD 15-minute candles from cTrader through Factor. One response supplies the value area, support, resistance, and the weekly and daily trend. The bars are kept for about 50 minutes, so the price poll does not download them again. If that request fails or returns nothing, the same map is built from Reaktor candles.
+2. Take the live cTrader bid and ask. Factor keeps that stream open, so a check reads the latest quote instead of opening a new session. The price on the map is the mid. A buy is checked and sent on the ask. A sell is checked and sent on the bid. If the quote is down, use Twelve Data, then the close of the last candle.
+3. Build two volume profiles from those bars: the last completed week, and the week still forming. Weeks start on Monday at 00:00 in Europe/Bucharest. Point of control (POC) is the price where the most ticks printed. The value area is the band around it that holds about 70% of that weight. VAH is the top of the band. VAL is the bottom.
+4. Send that map, the bid, the ask, the open position, any working pending order, and the recent closed trades to the model. The model answers with one JSON decision: leave the book, place a market order, or place a pending order. It also returns a stop, a target, a confidence score, and up to four prices that should wake an earlier check.
 
 The primary model is `gemini-3.6-flash`, with two tries. A rate limit skips the remaining try. A timeout or HTTP 503 waits 20 seconds and uses the second try. If Flash fails, `gemini-4-hydrogen` takes the same two tries. If that fails too, Grok 4.7 takes the check once. If every model fails, the check stores the error and sends no order.
 
@@ -26,7 +25,7 @@ The model never talks to the broker. Python accepts or rejects the idea, then Fa
 4. A market order is allowed only while gold is open. A pending order is allowed during the weekday 21:00–22:00 UTC break, and is blocked from Friday 21:00 UTC through Sunday 22:00 UTC. Gold is also closed for that same hour on other weekdays.
 5. The stop and target must sit on the correct side of the entry. The stop must be at least $5 away. At the default 0.01 lot, one dollar of gold price is about one dollar of profit or loss, and the stop may not risk more than $25. Reward must be at least 1.2 times the risk.
 6. Python chooses the order type. A market order is for a level price is already at. A buy limit rests below the price and a buy stop rests above it. A sell limit rests above the price and a sell stop rests below it. Size is fixed at `VOLUME_LOTS`. The model's own size is ignored.
-7. The accepted order is `POST /api/ai/orders` on Factor: account, `XAUUSD`, side, volume, order type, entry, stop, target, and the label `POC`. Factor places it on the cTrader account in `FACTOR_ACCOUNT_ID`.
+7. The accepted order is `POST /api/ai/orders` on Factor: account, `XAUUSD`, side, volume, order type, entry, stop, target, and the label `POC`. A market buy is priced on the ask and a market sell on the bid. Factor places it on the cTrader account in `FACTOR_ACCOUNT_ID`.
 8. A market fill is stored as an open trade. A limit or stop is stored as the one working pending order. Telegram names the cTrader order id. A later close figure is the quote when the position left Factor's open list, not the broker fill.
 
 `FACTOR_MODE=stub` keeps the same checks and stores the order in memory. Nothing is sent to Factor or cTrader.
@@ -39,10 +38,10 @@ Services:
 | --- | --- | --- |
 | Python 3.11 or newer | Yes | Runs the process |
 | Gemini API | Yes | Primary decision, then the Hydrogen fallback |
-| Reaktor candles | Yes | XAU/USD 15-minute bars in Supabase `public.candles`. Read only |
-| Factor | To send orders | cTrader orders, open positions, and 15-minute tick bars |
-| cTrader account | To send orders | The account id Factor should trade |
-| Twelve Data | No | Live XAU/USD price. The last candle close is the fallback |
+| Factor | To send orders and read the market | cTrader orders, open positions, 15-minute bars, and the live bid/ask |
+| cTrader account | To send orders and read the market | The account id Factor should trade |
+| Reaktor candles | Fallback | Used only when the cTrader bars do not load |
+| Twelve Data | No | Live price when the cTrader quote does not load. The last candle close is the next fallback |
 | xAI | No | Grok 4.7 when both Gemini models fail |
 | Telegram | No | Order notes, errors, a 12-hour note, and commands |
 
@@ -79,8 +78,8 @@ Fill `.env` before the first run. Startup refuses to start without `GEMINI_API_K
 | `GEMINI_FALLBACK_MODEL` | Second Gemini model. Default `gemini-4-hydrogen` |
 | `XAI_API_KEY` | Grok key. `GROK_API_KEY` is accepted under the same name |
 | `GROK_MODEL` | Default `grok-4.7` |
-| `TWELVEDATA_API_KEY` | Live price. Optional |
-| `REAKTOR_SUPABASE_URL` | Reaktor project URL |
+| `TWELVEDATA_API_KEY` | Fallback live price. Optional when Factor can quote |
+| `REAKTOR_SUPABASE_URL` | Reaktor project URL. Required at startup; used when cTrader bars fail |
 | `REAKTOR_SUPABASE_KEY` | Key that can read `public.candles` |
 | `FACTOR_BASE_URL` | Factor origin, with no path |
 | `FACTOR_API_TOKEN` | Bearer token for the Factor AI routes |

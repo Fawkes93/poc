@@ -67,7 +67,7 @@ async def _serve(settings: Settings, store: Store) -> None:
         await asyncio.to_thread(cycle, "schedule")
 
     async def alerts() -> None:
-        from poc.quote import latest_price
+        from poc.quote import live_mid
 
         while True:
             try:
@@ -76,7 +76,7 @@ async def _serve(settings: Settings, store: Store) -> None:
                     settings,
                     store,
                     factor,
-                    lambda: latest_price(settings),
+                    lambda: live_mid(settings, factor),
                     alert_state,
                     cycle,
                 )

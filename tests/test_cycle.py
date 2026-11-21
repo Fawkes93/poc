@@ -8,7 +8,7 @@ from poc.ai.client import decide
 from poc.ai.prompt import system_prompt
 from poc.broker import StubBroker
 from poc.config import Settings
-from poc.cycle import run_cycle
+from poc.cycle import clear_market_bars, run_cycle
 from poc.market import Bar
 from poc.models import Decision
 from poc.store import Store
@@ -187,6 +187,105 @@ def test_profile_uses_ctrader_tick_counts(tmp_path):
     detail = json.loads(row["detail"])
     assert detail["profile"] == "ctrader"
     assert detail["prior"]["poc"] == 101.0
+
+
+def test_ctrader_quote_buys_the_ask_and_sells_the_bid(tmp_path):
+    class Quoted(StubBroker):
+        def quote(self):
+            return {"bid": 2399.0, "ask": 2401.0}
+
+    buy_book = _store(tmp_path)
+    buy_broker = Quoted()
+    seen: list[dict] = []
+    run_cycle(
+        settings=Settings(),
+        store=buy_book,
+        factor=buy_broker,
+        now=NOW,
+        decide=lambda context: seen.append(context)
+        or _decision(
+            action="market",
+            side="buy",
+            stop_loss=2380,
+            take_profit=2430,
+            reasoning="buy the ask",
+        ),
+        candles=_bars(),
+    )
+    assert seen[0]["price"] == 2400
+    assert seen[0]["bid"] == 2399
+    assert seen[0]["ask"] == 2401
+    assert buy_broker.orders[0]["payload"]["entry_price"] == 2401
+
+    sell_broker = Quoted()
+    run_cycle(
+        settings=Settings(),
+        store=_store(tmp_path),
+        factor=sell_broker,
+        now=NOW,
+        decide=lambda context: _decision(
+            action="market",
+            side="sell",
+            stop_loss=2420,
+            take_profit=2370,
+            reasoning="sell the bid",
+        ),
+        candles=_bars(),
+    )
+    assert sell_broker.orders[0]["payload"]["entry_price"] == 2399
+
+
+def test_ctrader_bars_are_loaded_once_and_used_for_the_map(tmp_path):
+    clear_market_bars()
+    calls = {"n": 0}
+
+    class Bars(StubBroker):
+        def quote(self):
+            return {"bid": 100.2, "ask": 100.4}
+
+        def list_trendbars(self, _since):
+            calls["n"] += 1
+            return [
+                {
+                    "open_time": "2026-11-03T10:00:00Z",
+                    "open": 100.0,
+                    "high": 101.0,
+                    "low": 100.0,
+                    "close": 100.5,
+                    "tick_count": 80,
+                },
+                {
+                    "open_time": "2026-11-03T10:15:00Z",
+                    "open": 100.2,
+                    "high": 101.2,
+                    "low": 100.1,
+                    "close": 100.8,
+                    "tick_count": 10,
+                },
+            ]
+
+    store = _store(tmp_path)
+    broker = Bars()
+    for _ in range(2):
+        run_cycle(
+            settings=Settings(),
+            store=store,
+            factor=broker,
+            now=NOW,
+            decide=lambda context: _decision(),
+        )
+    assert calls["n"] == 1
+    import json
+
+    with store._connect() as conn:
+        row = conn.execute(
+            "SELECT detail FROM logs WHERE event = 'cycle' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    detail = json.loads(row["detail"])
+    assert detail["candles"] == "ctrader"
+    assert detail["profile"] == "ctrader"
+    assert detail["quote"] == "ctrader"
+    clear_market_bars()
 
 
 def test_notes_name_the_ctrader_order(tmp_path):

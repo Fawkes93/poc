@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -17,11 +18,48 @@ from poc.levels import build_levels
 from poc.market import as_utc, session_name, weekend_closed
 from poc.models import Decision, ManageItem
 from poc.profile import build_profile, developing_week, previous_week, with_location
-from poc.quote import latest_price
+from poc.quote import latest_price, spot_quote
 from poc.risk import check_entry, check_manage, entry_block, pnl_result, pnl_usd
 from poc.store import Store
 
 _LOCK = threading.Lock()
+_BAR_CACHE_SEC = 50 * 60
+_bar_lock = threading.Lock()
+_bar_cache: dict[str, Any] = {"at": 0.0, "bars": None, "source": ""}
+
+
+def clear_market_bars() -> None:
+    with _bar_lock:
+        _bar_cache["at"] = 0.0
+        _bar_cache["bars"] = None
+        _bar_cache["source"] = ""
+
+
+def _cached_bars() -> tuple[list, str] | None:
+    with _bar_lock:
+        bars = _bar_cache["bars"]
+        stored = _bar_cache["at"]
+        source = _bar_cache["source"]
+    if not bars or not stored:
+        return None
+    if time.monotonic() - stored > _BAR_CACHE_SEC:
+        return None
+    return list(bars), str(source)
+
+
+def _store_bars(bars: list, source: str) -> None:
+    with _bar_lock:
+        _bar_cache["at"] = time.monotonic()
+        _bar_cache["bars"] = list(bars)
+        _bar_cache["source"] = source
+
+
+def _side_price(side: str | None, bid: float | None, ask: float | None, price: float) -> float:
+    if side == "buy" and ask is not None:
+        return float(ask)
+    if side == "sell" and bid is not None:
+        return float(bid)
+    return float(price)
 
 
 @dataclass
@@ -113,6 +151,35 @@ def _notify_error(store: Store, notify: Callable[[str], None] | None, message: s
     notify(f"POC error\n{message[:500]}")
     store.set("last_error_sig", message[:180])
     store.set("last_error_at", _iso(now))
+
+
+def _market_bars(factor: Any, settings: Settings, store: Store, now: datetime) -> tuple[list, str]:
+    """One 15-minute load for the map. cTrader is cached so the price poll does not pull history."""
+    cached = _cached_bars()
+    if cached is not None:
+        return cached
+    loader = getattr(factor, "list_trendbars", None)
+    if loader is not None:
+        since = as_utc(now) - timedelta(days=settings.history_days)
+        failed = False
+        try:
+            rows = loader(since)
+            bars = bars_from_trendbars(rows if isinstance(rows, list) else [])
+        except Exception as exc:
+            failed = True
+            store.log("warn", "profile_bars", str(exc)[:300])
+            bars = []
+        if bars:
+            _store_bars(bars, "ctrader")
+            return bars, "ctrader"
+        if not failed:
+            store.log("warn", "profile_bars", "cTrader returned no 15-minute bars")
+    try:
+        bars = load_recent(settings, now)
+    except Exception as exc:
+        store.log("warn", "profile_bars", str(exc)[:300])
+        return [], "reaktor"
+    return bars, "reaktor" if bars else "none"
 
 
 def _profile_bars(
@@ -522,16 +589,30 @@ def _run(
 ) -> CycleResult:
     result = CycleResult(run_id=run_id)
     quote_source = "given"
+    candle_source = "given"
+    bid: float | None = None
+    ask: float | None = None
     if candles is None:
-        candles = load_recent(settings, now)
+        candles, candle_source = _market_bars(factor, settings, store, now)
     if price is None:
+        spot = None
         try:
-            price = latest_price(settings)
-            quote_source = "twelvedata"
+            spot = spot_quote(factor)
         except Exception as exc:
-            price = latest_close(candles)
-            quote_source = "candle_close"
-            store.log("warn", "quote", str(exc))
+            store.log("warn", "quote", str(exc)[:300])
+        if spot is not None:
+            bid = spot["bid"]
+            ask = spot["ask"]
+            price = (bid + ask) / 2
+            quote_source = "ctrader"
+        else:
+            try:
+                price = latest_price(settings)
+                quote_source = "twelvedata"
+            except Exception as exc:
+                price = latest_close(candles)
+                quote_source = "candle_close"
+                store.log("warn", "quote", str(exc)[:300])
     result.price = price
     if price is None:
         result.reason = "no_price"
@@ -542,7 +623,10 @@ def _run(
 
     week_start, week_end = previous_week(now)
     dev_start, dev_end = developing_week(now)
-    profile_bars, profile_source = _profile_bars(factor, settings, store, now, candles)
+    if candle_source == "given":
+        profile_bars, profile_source = _profile_bars(factor, settings, store, now, candles)
+    else:
+        profile_bars, profile_source = candles, candle_source
     prior = with_location(build_profile(profile_bars, week_start, week_end), price)
     developing = with_location(build_profile(profile_bars, dev_start, dev_end), price)
     levels = build_levels(candles, now, price, settings.sr_cluster_usd)
@@ -563,6 +647,7 @@ def _run(
             "trigger": trigger,
             "price": price,
             "quote": quote_source,
+            "candles": candle_source,
             "profile": profile_source,
             "prior": prior.view(),
             "developing": developing.view(),
@@ -597,6 +682,8 @@ def _run(
         "weekend": False,
         "market_open": session_name(now) != "closed",
         "price": price,
+        "bid": price if bid is None else bid,
+        "ask": price if ask is None else ask,
         "prior_week": prior.view(),
         "developing_week": developing.view(),
         "trend": levels["trend"],
@@ -653,7 +740,7 @@ def _run(
         decision,
         settings=settings,
         now=now,
-        price=price,
+        price=_side_price(decision.side, bid, ask, price),
         positions=positions or [],
         profile_ready=prior.poc is not None,
         daily_loss=0.0,

@@ -10,7 +10,7 @@ prior_week is the last completed week, Monday to Monday in Europe/Bucharest. poc
 
 trend.w1 and trend.d1 are up, down, flat, or insufficient. zones are nearby swing support and resistance. A trade needs a reason tied to poc, vah, or val, read together with the trend and the nearest support or resistance.
 
-Use action "market" when price is at the level now and gold is open. Use action "pending" when the level is away: a limit rests on the near side of price, a stop rests beyond price. Buy limit below price, buy stop above price, sell limit above price, sell stop below price. The code chooses limit or stop from your entry_price. Put the stop beyond the level that cancels the idea, and the target at the next of poc, vah, val, or a nearby zone.
+price is the mid of bid and ask. A buy is checked and sent on the ask. A sell is checked and sent on the bid. Use action "market" when price is at the level now and gold is open. Use action "pending" when the level is away: a limit rests on the near side of price, a stop rests beyond price. Buy limit below price, buy stop above price, sell limit above price, sell stop below price. The code chooses limit or stop from your entry_price. Put the stop beyond the level that cancels the idea, and the target at the next of poc, vah, val, or a nearby zone.
 
 One active trade. When a position is open, or a pending order is working, action is "none". Manage the open position. When the book is flat, a new trade is allowed. When a pending order is working and the idea is stale, cancel that order id and you may return a new order in the same answer. When the pending order still matches the map, leave it and use action "none".
 

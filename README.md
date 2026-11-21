@@ -6,7 +6,7 @@ Hourly XAUUSD book. A model reads last week's value area and the nearby support 
 
 Each check builds a short picture of gold and asks a model what to do with one book.
 
-1. Load XAU/USD 15-minute candles from cTrader through Factor. One response supplies the value area, support, resistance, and the weekly and daily trend. The bars are kept for about 50 minutes, so the price poll does not download them again. If that request fails or returns nothing, the same map is built from Reaktor candles.
+1. Load the last 21 days of XAU/USD 15-minute candles from cTrader through Factor. That is one cTrader slice. It covers the two weeks the value area uses, and the same bars supply support, resistance, and the daily trend. The weekly trend stays thin on that window. The bars are kept for about 50 minutes, so the price poll does not download them again. If that request fails or returns nothing, the same map is built from Reaktor candles.
 2. Take the live cTrader bid and ask. Factor keeps that stream open, so a check reads the latest quote instead of opening a new session. The price on the map is the mid. A buy is checked and sent on the ask. A sell is checked and sent on the bid. If the quote is down, use Twelve Data, then the close of the last candle.
 3. Build two volume profiles from those bars: the last completed week, and the week still forming. Weeks start on Monday at 00:00 in Europe/Bucharest. Point of control (POC) is the price where the most ticks printed. The value area is the band around it that holds about 70% of that weight. VAH is the top of the band. VAL is the bottom.
 4. Send that map, the bid, the ask, the open position, any working pending order, and the recent closed trades to the model. The model answers with one JSON decision: leave the book, place a market order, or place a pending order. It also returns a stop, a target, a confidence score, and up to four prices that should wake an earlier check.
@@ -94,6 +94,10 @@ Fill `.env` before the first run. Startup refuses to start without `GEMINI_API_K
 | `MIN_STOP_USD` | Closest allowed stop. Default `5` |
 | `MIN_RR` | Minimum reward divided by risk. Default `1.2` |
 | `MIN_CONFIDENCE` | Minimum model score, from 0 to 100. Default `60` |
+| `HISTORY_DAYS` | cTrader history loaded each check. Default `21`, one slice. A longer value is several slices, newest first |
+| `LOG_HTTP` | `true` serves the log page. `false` leaves it off |
+| `LOG_HTTP_HOST` | Bind address. Default `127.0.0.1` |
+| `LOG_HTTP_PORT` | Default `8787` |
 
 ```bash
 python -m poc --once
@@ -101,7 +105,11 @@ python -m poc
 pytest -q
 ```
 
-`python -m poc --once` runs a single check and exits. `python -m poc` stays up: a check at minute 5 of every UTC hour, a price poll every 60 seconds, and Telegram commands when a bot token is set. When the live price crosses a level the model left, that poll runs one extra check. Another alert check then waits 10 minutes. `.env` and `poc.sqlite` stay on the machine. Neither file is part of the repository.
+`python -m poc --once` runs a single check and exits. `python -m poc` stays up: a check at minute 5 of every UTC hour, a price poll every 60 seconds, a log page, and Telegram commands when a bot token is set. When the live price crosses a level the model left, that poll runs one extra check. Another alert check then waits 10 minutes. `.env` and `poc.sqlite` stay on the machine. Neither file is part of the repository.
+
+## Logs
+
+`python -m poc` serves the log at http://127.0.0.1:8787/. The page lists the newest rows and refreshes every 5 seconds. Info, Warning, and Error each keep their own view. Warning is the `warn` level in SQLite. Error also includes rows from the errors table. The page binds to localhost. Set `LOG_HTTP=false` to leave it off.
 
 ## Messages
 

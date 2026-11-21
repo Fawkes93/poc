@@ -61,11 +61,14 @@ class Settings:
     min_confidence: float = 60.0
     max_daily_loss_usd: float = 25.0
     sr_cluster_usd: float = 8.0
-    history_days: int = 120
+    history_days: int = 21
     ai_timeout_sec: float = 90.0
     alert_poll_sec: int = 60
     alert_debounce_sec: int = 600
     heartbeat_hours: int = 12
+    log_http: bool = True
+    log_http_host: str = "127.0.0.1"
+    log_http_port: int = 8787
     max_alerts: int = 4
     check_minute: int = 5
     db_path: str = ""
@@ -124,10 +127,13 @@ class Settings:
             min_confidence=_float("MIN_CONFIDENCE", 60.0),
             max_daily_loss_usd=_float("MAX_DAILY_LOSS_USD", 25.0),
             sr_cluster_usd=_float("SR_CLUSTER_USD", 8.0),
-            history_days=_int("HISTORY_DAYS", 120),
+            history_days=_int("HISTORY_DAYS", 21),
             ai_timeout_sec=_float("AI_TIMEOUT_SEC", 90.0),
             alert_poll_sec=_int("ALERT_POLL_SEC", 60),
             alert_debounce_sec=_int("ALERT_DEBOUNCE_SEC", 600),
             heartbeat_hours=_int("HEARTBEAT_HOURS", 12),
+            log_http=_bool("LOG_HTTP", True),
+            log_http_host=os.getenv("LOG_HTTP_HOST", "127.0.0.1").strip() or "127.0.0.1",
+            log_http_port=_int("LOG_HTTP_PORT", 8787),
             db_path=os.getenv("POC_DB", "").strip(),
         )

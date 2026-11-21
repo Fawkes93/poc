@@ -1,49 +1,100 @@
 # POC
 
-Hourly XAUUSD book. Gemini reads the weekly value area and nearby support and resistance, then proposes one order. Python checks the idea. [Factor](https://github.com/Fawkes93/factor) places anything that passes on cTrader with the label `POC`.
+Hourly XAUUSD book. A model reads last week's value area and the nearby support and resistance, then proposes one order. Python checks the idea. [Factor](https://github.com/Fawkes93/factor) places anything that passes on cTrader with the label `POC`.
 
-The primary model is `gemini-3.6-flash`. Each Gemini model gets two tries. A rate limit skips the remaining tries of that model. A timeout or HTTP 503 waits 20 seconds and uses the second try. If Flash fails, `gemini-4-hydrogen` takes the check. If that fails too, Grok 4.7 takes it once.
+## How it decides
 
-## Map
+Each check builds a short picture of gold and asks a model what to do with one book.
 
-The context is last week's point of control, value-area high, and value-area low, plus the week still forming. Those prices come from cTrader 15-minute tick volume through Factor. If that request fails or returns no bars, the profile falls back to Reaktor candles. Support, resistance, and the weekly and daily trend always use the Reaktor candles.
+1. Load XAU/USD 15-minute candles from Reaktor. These candles supply support, resistance, and the weekly and daily trend.
+2. Take the live price from Twelve Data. If that call fails, use the close of the last candle.
+3. Build two volume profiles: the last completed week, and the week still forming. Weeks start on Monday at 00:00 in Europe/Bucharest. The preferred bars are cTrader 15-minute ticks from Factor. If that request fails or returns nothing, the same profiles are built from the Reaktor candles.
+4. Point of control (POC) is the price where the most ticks printed. The value area is the band around it that holds about 70% of that weight. VAH is the top of the band. VAL is the bottom.
+5. Send that map, the live price, the open position, any working pending order, and the recent closed trades to the model. The model answers with one JSON decision: leave the book, place a market order, or place a pending order. It also returns a stop, a target, a confidence score, and up to four prices that should wake an earlier check.
 
-A market order is for a level price is already at. A pending limit or stop is for a level price still has to reach. The book holds one active trade. A new order is blocked while a position or a pending order is working. After it closes, the next check can enter again. The model can leave prices that wake a check before the next hour. Loss on 0.01 lot is capped at $25.
+The primary model is `gemini-3.6-flash`, with two tries. A rate limit skips the remaining try. A timeout or HTTP 503 waits 20 seconds and uses the second try. If Flash fails, `gemini-4-hydrogen` takes the same two tries. If that fails too, Grok 4.7 takes the check once. If every model fails, the check stores the error and sends no order.
 
-## Schedule
+The book holds one active trade. A new order is blocked while a position is open or a pending order is still working. After that trade is gone, the next check can enter again. On the weekend the check does not ask the model and does not send an order. The open trade is left with its stop.
 
-Checks run at minute 5 of every UTC hour. Gold is closed from Friday 21:00 UTC through Sunday 22:00 UTC. On other weekdays the market is closed from 21:00 to 22:00 UTC. A pending order is still allowed during that weekday break. A market order is not. The weekend blocks both.
+## How an order is placed
 
-## State and messages
+The model never talks to the broker. Python accepts or rejects the idea, then Factor sends the order.
 
-Notes, orders, and errors are stored in `poc.sqlite` beside the process. That file stays on the machine that runs the process.
+1. If the model asks to cancel the working pending order, that cancel goes to Factor first. A replacement is allowed in the same check only after the cancel is confirmed.
+2. If a position is open, the model may leave it, close it, or move the stop to the entry price. A stop is not widened.
+3. A new idea is rejected when trading is off, the book is halted, confidence is below 60, the value area is missing, the position list could not be loaded, or another trade is already working.
+4. A market order is allowed only while gold is open. A pending order is allowed during the weekday 21:00–22:00 UTC break, and is blocked from Friday 21:00 UTC through Sunday 22:00 UTC. Gold is also closed for that same hour on other weekdays.
+5. The stop and target must sit on the correct side of the entry. The stop must be at least $5 away. At the default 0.01 lot, one dollar of gold price is about one dollar of profit or loss, and the stop may not risk more than $25. Reward must be at least 1.2 times the risk.
+6. Python chooses the order type. A market order is for a level price is already at. A buy limit rests below the price and a buy stop rests above it. A sell limit rests above the price and a sell stop rests below it. Size is fixed at `VOLUME_LOTS`. The model's own size is ignored.
+7. The accepted order is `POST /api/ai/orders` on Factor: account, `XAUUSD`, side, volume, order type, entry, stop, target, and the label `POC`. Factor places it on the cTrader account in `FACTOR_ACCOUNT_ID`.
+8. A market fill is stored as an open trade. A limit or stop is stored as the one working pending order. Telegram names the cTrader order id. A later close figure is the quote when the position left Factor's open list, not the broker fill.
 
-Telegram messages name the cTrader order id. A close figure is the quote when the position left the open list, not the broker fill. Errors, and a short note every 12 hours, go to the same chats.
+`FACTOR_MODE=stub` keeps the same checks and stores the order in memory. Nothing is sent to Factor or cTrader.
 
-`/start` links the owner chat. `TELEGRAM_CHAT_ID` does the same when it is set before the first `/start`. `/subscribe` adds another chat. `/unsubscribe` removes it. Subscribed chats receive notes only. `/status`, `/halt`, `/resume`, and `/flat` stay on the owner chat.
+## Dependencies
 
-## Requirements
+Services:
 
-- Python 3.11 or newer
-- A Factor deployment that accepts the `POC` label and serves `GET /api/ai/trendbars`
-- Reaktor `public.candles` for XAU/USD, read only
-- A Gemini API key
-- Optional: an xAI key for the Grok fallback, a Twelve Data key for the live price, a Telegram bot token
+| Service | Required | What it is used for |
+| --- | --- | --- |
+| Python 3.11 or newer | Yes | Runs the process |
+| Gemini API | Yes | Primary decision, then the Hydrogen fallback |
+| Reaktor candles | Yes | XAU/USD 15-minute bars in Supabase `public.candles`. Read only |
+| Factor | To send orders | cTrader orders, open positions, and 15-minute tick bars |
+| cTrader account | To send orders | The account id Factor should trade |
+| Twelve Data | No | Live XAU/USD price. The last candle close is the fallback |
+| xAI | No | Grok 4.7 when both Gemini models fail |
+| Telegram | No | Order notes, errors, a 12-hour note, and commands |
 
-The process reads Reaktor candles and the Twelve Data last price. It does not write those tables. Price falls back to the last closed candle when Twelve Data has no quote.
+Python packages in `requirements.txt`:
 
-## Setup
+| Package | What it is used for |
+| --- | --- |
+| `httpx` | Calls to Gemini, xAI, Twelve Data, Reaktor, Factor, and Telegram |
+| `pydantic` | Parses the model decision |
+| `apscheduler` | Hourly check |
+| `python-telegram-bot` | Command bot |
+| `python-dotenv` | Loads `.env` |
+| `pytest` | Tests |
+
+## Install locally
 
 ```bash
+git clone https://github.com/Fawkes93/poc.git
+cd poc
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Fill `.env`. Required at startup: `GEMINI_API_KEY`, `REAKTOR_SUPABASE_URL`, and `REAKTOR_SUPABASE_KEY`. Order calls also need `FACTOR_BASE_URL`, `FACTOR_API_TOKEN`, and `FACTOR_ACCOUNT_ID`.
+On Windows the virtualenv activates with `.venv\Scripts\activate`.
 
-The sample file sets `TRADING_ENABLED=false`. Set it to `true` to send orders. If that variable is omitted, the process default is on. `FACTOR_MODE` defaults to `http`.
+Fill `.env` before the first run. Startup refuses to start without `GEMINI_API_KEY`, `REAKTOR_SUPABASE_URL`, and `REAKTOR_SUPABASE_KEY`.
+
+| Variable | Purpose |
+| --- | --- |
+| `GEMINI_API_KEY` | Gemini key |
+| `GEMINI_MODEL` | Primary model. Default `gemini-3.6-flash` |
+| `GEMINI_FALLBACK_MODEL` | Second Gemini model. Default `gemini-4-hydrogen` |
+| `XAI_API_KEY` | Grok key. `GROK_API_KEY` is accepted under the same name |
+| `GROK_MODEL` | Default `grok-4.7` |
+| `TWELVEDATA_API_KEY` | Live price. Optional |
+| `REAKTOR_SUPABASE_URL` | Reaktor project URL |
+| `REAKTOR_SUPABASE_KEY` | Key that can read `public.candles` |
+| `FACTOR_BASE_URL` | Factor origin, with no path |
+| `FACTOR_API_TOKEN` | Bearer token for the Factor AI routes |
+| `FACTOR_ACCOUNT_ID` | cTrader account id |
+| `FACTOR_MODE` | `http` to send orders, `stub` to keep them in memory |
+| `TRADING_ENABLED` | `true` sends orders. The sample file sets `false`. If the variable is omitted, the process default is on |
+| `AI_LABEL` | Broker label. Default `POC` |
+| `TELEGRAM_BOT_TOKEN` | Bot token. Optional |
+| `TELEGRAM_CHAT_ID` | Owner chat, if `/start` has not linked one yet |
+| `VOLUME_LOTS` | Fixed size. Default `0.01` |
+| `MAX_LOSS_USD` | Most one order may lose at that size. Default `25` |
+| `MIN_STOP_USD` | Closest allowed stop. Default `5` |
+| `MIN_RR` | Minimum reward divided by risk. Default `1.2` |
+| `MIN_CONFIDENCE` | Minimum model score, from 0 to 100. Default `60` |
 
 ```bash
 python -m poc --once
@@ -51,8 +102,14 @@ python -m poc
 pytest -q
 ```
 
-`python -m poc` runs the hourly schedule, the price-alert poll, and Telegram commands when `TELEGRAM_BOT_TOKEN` is set.
+`python -m poc --once` runs a single check and exits. `python -m poc` stays up: a check at minute 5 of every UTC hour, a price poll every 60 seconds, and Telegram commands when a bot token is set. When the live price crosses a level the model left, that poll runs one extra check. Another alert check then waits 10 minutes. `.env` and `poc.sqlite` stay on the machine. Neither file is part of the repository.
+
+## Messages
+
+`/start` links the owner chat. `/subscribe` adds another chat. `/unsubscribe` removes it. Subscribed chats receive the same notes and cannot place or flatten trades. `/status`, `/halt`, `/resume`, and `/flat` stay on the owner chat. `/halt` blocks a new entry and leaves an open position in place. `/flat` closes POC positions and cancels the working pending order.
+
+Notes, orders, and errors are stored in `poc.sqlite` beside the process. Errors, and a short note every 12 hours, go to the linked chats.
 
 ## Risk
 
-The process can place, cancel, and close broker orders on the configured cTrader account. Size, loss, and session checks reject some ideas. They do not cap account loss beyond the per-order and daily limits in `.env`. Run against a demo account until the path is trusted. One process only. A second copy can send a second order.
+The process can place, cancel, and close broker orders on the configured cTrader account. The checks above reject some ideas. They do not limit losses beyond that per-order cap. Use a demo account until the path is trusted. Run one process only. A second copy can send a second order.
